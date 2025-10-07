@@ -1,50 +1,38 @@
+/* src/ls-v1.0.0.c
+ * ls v1.3.0: supports -l (long), default column display (down then across),
+ * and -x horizontal (across then wrap) display.
+ */
+
 #define _XOPEN_SOURCE 700
 #define _GNU_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <pwd.h>
 #include <grp.h>
 #include <time.h>
 #include <limits.h>
 #include <getopt.h>
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <pwd.h>
-#include <grp.h>
-#include <time.h>
-#include <unistd.h>
-#include <errno.h>
-#include <limits.h>
 #include <sys/ioctl.h>
+#include <errno.h>
 
-typedef struct {
-    char *name;
-    char *fullpath;
-    struct stat st;
-    char *owner;
-    char *group;
-    char timestr[32];
-    char *linktarget;
-} fileinfo_t;
-
-/* --- utilities used by long-listing --- */
+/* ------------ utilities ---------------- */
 static void mode_to_str(mode_t m, char *out) {
     out[0] = S_ISDIR(m) ? 'd' :
              S_ISLNK(m) ? 'l' :
              S_ISCHR(m) ? 'c' :
              S_ISBLK(m) ? 'b' :
              S_ISFIFO(m)? 'p' :
-             S_ISSOCK(m)? 's' : '-';
+#ifdef S_ISSOCK
+             S_ISSOCK(m)? 's' :
+#endif
+             '-';
 
     out[1] = (m & S_IRUSR) ? 'r' : '-';
     out[2] = (m & S_IWUSR) ? 'w' : '-';
@@ -58,8 +46,12 @@ static void mode_to_str(mode_t m, char *out) {
 
     out[7] = (m & S_IROTH) ? 'r' : '-';
     out[8] = (m & S_IWOTH) ? 'w' : '-';
+#ifdef S_ISVTX
     if (m & S_ISVTX) out[9] = (m & S_IXOTH) ? 't' : 'T';
     else out[9] = (m & S_IXOTH) ? 'x' : '-';
+#else
+    out[9] = (m & S_IXOTH) ? 'x' : '-';
+#endif
 
     out[10] = '\0';
 }
@@ -80,18 +72,32 @@ static void build_timestr(time_t t, char *buf, size_t bufsz) {
     }
 }
 
-/* --- long listing (uses lstat, getpwuid, getgrgid, ctime) --- */
+/* ------------ long-listing structures & functions -------------- */
+typedef struct {
+    char *name;
+    char *fullpath;
+    struct stat st;
+    char *owner;
+    char *group;
+    char timestr[32];
+    char *linktarget;
+} fileinfo_t;
+
 static int read_dir_collect(const char *path, fileinfo_t **out_array, size_t *out_count) {
     DIR *d = opendir(path);
     if (!d) return -1;
     struct dirent *entry;
     size_t cap = 64, n = 0;
     fileinfo_t *arr = calloc(cap, sizeof(fileinfo_t));
+    if (!arr) { closedir(d); return -1; }
+
     while ((entry = readdir(d))) {
         if (strcmp(entry->d_name, ".") == 0) continue;
         if (n == cap) {
             cap *= 2;
-            arr = realloc(arr, cap * sizeof(fileinfo_t));
+            fileinfo_t *tmp = realloc(arr, cap * sizeof(fileinfo_t));
+            if (!tmp) break;
+            arr = tmp;
         }
         fileinfo_t *fi = &arr[n];
         fi->name = strdup(entry->d_name);
@@ -103,7 +109,7 @@ static int read_dir_collect(const char *path, fileinfo_t **out_array, size_t *ou
             fi->owner = strdup("?");
             fi->group = strdup("?");
             fi->linktarget = NULL;
-            strcpy(fi->timestr, "??? ?? ??:??");
+            strncpy(fi->timestr, "??? ?? ??:??", sizeof(fi->timestr));
             n++;
             continue;
         }
@@ -116,14 +122,12 @@ static int read_dir_collect(const char *path, fileinfo_t **out_array, size_t *ou
 
         if (S_ISLNK(fi->st.st_mode)) {
             ssize_t r;
-            char linkbuf[PATH_MAX+1];
+            char linkbuf[PATH_MAX + 1];
             r = readlink(fi->fullpath, linkbuf, sizeof(linkbuf)-1);
             if (r > 0) {
                 linkbuf[r] = '\0';
                 fi->linktarget = strdup(linkbuf);
-            } else {
-                fi->linktarget = NULL;
-            }
+            } else fi->linktarget = NULL;
         } else {
             fi->linktarget = NULL;
         }
@@ -153,7 +157,6 @@ static void long_list(const char *path) {
         fprintf(stderr, "Cannot open directory '%s': %s\n", path, strerror(errno));
         return;
     }
-
     size_t w_links = 1, w_owner = 1, w_group = 1, w_size = 1;
     for (size_t i = 0; i < n; ++i) {
         char buf[64];
@@ -164,9 +167,8 @@ static void long_list(const char *path) {
         snprintf(buf, sizeof(buf), "%lld", (long long)arr[i].st.st_size);
         if (strlen(buf) > w_size) w_size = strlen(buf);
     }
-
     for (size_t i = 0; i < n; ++i) {
-        char perm[11];
+        char perm[12];
         mode_to_str(arr[i].st.st_mode, perm);
         unsigned long links = (unsigned long)arr[i].st.st_nlink;
         long long sz = (long long)arr[i].st.st_size;
@@ -189,11 +191,10 @@ static void long_list(const char *path) {
                    arr[i].name);
         }
     }
-
     free_fileinfo_array(arr, n);
 }
 
-/* --- new: column display (down then across) for default listing --- */
+/* ------------ name-only list helpers (for default & -x) ------------ */
 static int cmp_strptr(const void *a, const void *b) {
     const char *const *pa = a;
     const char *const *pb = b;
@@ -203,12 +204,11 @@ static int cmp_strptr(const void *a, const void *b) {
 static int get_terminal_width(void) {
     struct winsize w;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == -1 || w.ws_col == 0) {
-        return 80; /* fallback */
+        return 80;
     }
     return (int)w.ws_col;
 }
 
-/* read names (skip entries starting with '.') and compute longest length */
 static int read_names(const char *path, char ***out_names, size_t *out_count, size_t *out_maxlen) {
     DIR *d = opendir(path);
     if (!d) return -1;
@@ -218,7 +218,7 @@ static int read_names(const char *path, char ***out_names, size_t *out_count, si
     size_t maxlen = 0;
     while ((e = readdir(d))) {
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        if (e->d_name[0] == '.') continue; /* skip hidden files */
+        if (e->d_name[0] == '.') continue;
         if (n == cap) {
             cap *= 2;
             arr = realloc(arr, cap * sizeof(char*));
@@ -230,7 +230,6 @@ static int read_names(const char *path, char ***out_names, size_t *out_count, si
     }
     closedir(d);
     if (n > 0) qsort(arr, n, sizeof(char*), cmp_strptr);
-
     *out_names = arr;
     *out_count = n;
     *out_maxlen = maxlen;
@@ -242,6 +241,7 @@ static void free_names(char **arr, size_t n) {
     free(arr);
 }
 
+/* ------------ default (down then across) column display ------------ */
 static void column_list(const char *path) {
     char **names = NULL;
     size_t n = 0;
@@ -264,18 +264,55 @@ static void column_list(const char *path) {
         for (int c = 0; c < cols; ++c) {
             size_t idx = c * rows + r;
             if (idx < n) {
-                /* print name padded to colwidth (but don't add extra spacing after last col) */
                 if (c == cols - 1) printf("%s", names[idx]);
                 else printf("%-*s", colwidth, names[idx]);
             }
         }
         printf("\n");
     }
-
     free_names(names, n);
 }
 
-/* --- fallback simple listing (not used; kept for reference) --- */
+/* ------------ new: horizontal (row-major) display for -x ------------ */
+static void horizontal_list(const char *path) {
+    char **names = NULL;
+    size_t n = 0;
+    size_t maxlen = 0;
+    if (read_names(path, &names, &n, &maxlen) == -1) {
+        fprintf(stderr, "Cannot open directory '%s': %s\n", path, strerror(errno));
+        return;
+    }
+    if (n == 0) { free_names(names, n); return; }
+
+    int termw = get_terminal_width();
+    int spacing = 2;
+    int colwidth = (int)maxlen + spacing;
+    if (colwidth <= 0) colwidth = 1;
+
+    int curw = 0;
+    for (size_t i = 0; i < n; ++i) {
+        int namelen = (int)strlen(names[i]);
+        /* if first on line, print without leading space; else ensure space/pad fits */
+        if (curw == 0) {
+            printf("%s", names[i]);
+            curw += namelen;
+        } else {
+            /* if printing this item padded would exceed term width, wrap */
+            if (curw + colwidth > termw) {
+                printf("\n");
+                printf("%s", names[i]);
+                curw = namelen;
+            } else {
+                printf("%-*s", colwidth, names[i]);
+                curw += colwidth;
+            }
+        }
+    }
+    printf("\n");
+    free_names(names, n);
+}
+
+/* ------------ fallback simple list (not used) ------------ */
 static void simple_list(const char *path) {
     DIR *d = opendir(path);
     if (!d) { fprintf(stderr, "Cannot open directory '%s': %s\n", path, strerror(errno)); return; }
@@ -288,14 +325,18 @@ static void simple_list(const char *path) {
     closedir(d);
 }
 
+/* --------------- main & arg parsing -------------- */
+enum display_mode { MODE_DEFAULT = 0, MODE_LONG = 1, MODE_HORIZONTAL = 2 };
+
 int main(int argc, char **argv) {
     int opt;
-    int longflag = 0;
-    while ((opt = getopt(argc, argv, "l")) != -1) {
+    enum display_mode mode = MODE_DEFAULT;
+    while ((opt = getopt(argc, argv, "lx")) != -1) {
         switch (opt) {
-            case 'l': longflag = 1; break;
+            case 'l': mode = MODE_LONG; break;
+            case 'x': mode = MODE_HORIZONTAL; break;
             default:
-                fprintf(stderr, "Usage: %s [-l] [path]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [-l] [-x] [path]\n", argv[0]);
                 exit(EXIT_FAILURE);
         }
     }
@@ -303,9 +344,9 @@ int main(int argc, char **argv) {
     const char *path = ".";
     if (optind < argc) path = argv[optind];
 
-    if (longflag) long_list(path);
+    if (mode == MODE_LONG) long_list(path);
+    else if (mode == MODE_HORIZONTAL) horizontal_list(path);
     else column_list(path);
 
     return 0;
 }
-
