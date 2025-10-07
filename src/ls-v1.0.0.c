@@ -1,9 +1,18 @@
-/* src/lsv1.0.0.c
- * Simple ls with optional -l long listing (version 1.1.0 feature)
- * Uses: lstat(), getpwuid(), getgrgid(), ctime()
- */
-
 #define _XOPEN_SOURCE 700
+#define _GNU_SOURCE
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <pwd.h>
+#include <grp.h>
+#include <time.h>
+#include <limits.h>
+#include <getopt.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +25,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
+#include <sys/ioctl.h>
 
 typedef struct {
     char *name;
@@ -24,11 +34,11 @@ typedef struct {
     char *owner;
     char *group;
     char timestr[32];
-    char *linktarget; /* for symlink -> target */
+    char *linktarget;
 } fileinfo_t;
 
+/* --- utilities used by long-listing --- */
 static void mode_to_str(mode_t m, char *out) {
-    /* out must hold at least 11 bytes */
     out[0] = S_ISDIR(m) ? 'd' :
              S_ISLNK(m) ? 'l' :
              S_ISCHR(m) ? 'c' :
@@ -36,19 +46,16 @@ static void mode_to_str(mode_t m, char *out) {
              S_ISFIFO(m)? 'p' :
              S_ISSOCK(m)? 's' : '-';
 
-    /* user */
     out[1] = (m & S_IRUSR) ? 'r' : '-';
     out[2] = (m & S_IWUSR) ? 'w' : '-';
     if (m & S_ISUID) out[3] = (m & S_IXUSR) ? 's' : 'S';
     else out[3] = (m & S_IXUSR) ? 'x' : '-';
 
-    /* group */
     out[4] = (m & S_IRGRP) ? 'r' : '-';
     out[5] = (m & S_IWGRP) ? 'w' : '-';
     if (m & S_ISGID) out[6] = (m & S_IXGRP) ? 's' : 'S';
     else out[6] = (m & S_IXGRP) ? 'x' : '-';
 
-    /* others */
     out[7] = (m & S_IROTH) ? 'r' : '-';
     out[8] = (m & S_IWOTH) ? 'w' : '-';
     if (m & S_ISVTX) out[9] = (m & S_IXOTH) ? 't' : 'T';
@@ -57,17 +64,13 @@ static void mode_to_str(mode_t m, char *out) {
     out[10] = '\0';
 }
 
-/* Build a timestring similar to "ls -l" using ctime() result.
- * ctime gives "Wed Jan 13 14:22:01 2021\n" -> we take substring "Jan 13 14:22"
- */
 static void build_timestr(time_t t, char *buf, size_t bufsz) {
-    char *ct = ctime(&t); /* e.g. "Wed Jan 13 14:22:01 2021\n" */
+    char *ct = ctime(&t);
     if (!ct) {
         strncpy(buf, "??? ?? ??:??", bufsz);
         buf[bufsz-1] = '\0';
         return;
     }
-    /* copy month day hh:mm (characters 4..15) */
     if (strlen(ct) >= 16) {
         strncpy(buf, ct + 4, 12);
         buf[12] = '\0';
@@ -77,6 +80,7 @@ static void build_timestr(time_t t, char *buf, size_t bufsz) {
     }
 }
 
+/* --- long listing (uses lstat, getpwuid, getgrgid, ctime) --- */
 static int read_dir_collect(const char *path, fileinfo_t **out_array, size_t *out_count) {
     DIR *d = opendir(path);
     if (!d) return -1;
@@ -84,9 +88,7 @@ static int read_dir_collect(const char *path, fileinfo_t **out_array, size_t *ou
     size_t cap = 64, n = 0;
     fileinfo_t *arr = calloc(cap, sizeof(fileinfo_t));
     while ((entry = readdir(d))) {
-        /* keep '.' and '..' if you like; ls shows them only with -a; default skip '.' */
         if (strcmp(entry->d_name, ".") == 0) continue;
-
         if (n == cap) {
             cap *= 2;
             arr = realloc(arr, cap * sizeof(fileinfo_t));
@@ -98,7 +100,6 @@ static int read_dir_collect(const char *path, fileinfo_t **out_array, size_t *ou
         snprintf(fi->fullpath, flen, "%s/%s", path, entry->d_name);
 
         if (lstat(fi->fullpath, &fi->st) == -1) {
-            /* On lstat failure, fill minimal and continue */
             fi->owner = strdup("?");
             fi->group = strdup("?");
             fi->linktarget = NULL;
@@ -113,7 +114,6 @@ static int read_dir_collect(const char *path, fileinfo_t **out_array, size_t *ou
         fi->group = strdup(gr ? gr->gr_name : "UNKNOWN");
         build_timestr(fi->st.st_mtime, fi->timestr, sizeof(fi->timestr));
 
-        /* if symlink, read link target */
         if (S_ISLNK(fi->st.st_mode)) {
             ssize_t r;
             char linkbuf[PATH_MAX+1];
@@ -154,31 +154,22 @@ static void long_list(const char *path) {
         return;
     }
 
-    /* compute column widths */
     size_t w_links = 1, w_owner = 1, w_group = 1, w_size = 1;
     for (size_t i = 0; i < n; ++i) {
         char buf[64];
         snprintf(buf, sizeof(buf), "%lu", (unsigned long)arr[i].st.st_nlink);
         if (strlen(buf) > w_links) w_links = strlen(buf);
-
         if (strlen(arr[i].owner) > w_owner) w_owner = strlen(arr[i].owner);
         if (strlen(arr[i].group) > w_group) w_group = strlen(arr[i].group);
-
         snprintf(buf, sizeof(buf), "%lld", (long long)arr[i].st.st_size);
         if (strlen(buf) > w_size) w_size = strlen(buf);
     }
 
-    /* print entries */
     for (size_t i = 0; i < n; ++i) {
         char perm[11];
         mode_to_str(arr[i].st.st_mode, perm);
-
-        /* links */
         unsigned long links = (unsigned long)arr[i].st.st_nlink;
-        /* size */
         long long sz = (long long)arr[i].st.st_size;
-
-        /* name (+ symlink target) */
         if (arr[i].linktarget) {
             printf("%s %*lu %-*s %-*s %*lld %s %s -> %s\n",
                    perm, (int)w_links, links,
@@ -202,16 +193,96 @@ static void long_list(const char *path) {
     free_fileinfo_array(arr, n);
 }
 
-/* fallback simple listing (names only) */
-static void simple_list(const char *path) {
+/* --- new: column display (down then across) for default listing --- */
+static int cmp_strptr(const void *a, const void *b) {
+    const char *const *pa = a;
+    const char *const *pb = b;
+    return strcmp(*pa, *pb);
+}
+
+static int get_terminal_width(void) {
+    struct winsize w;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == -1 || w.ws_col == 0) {
+        return 80; /* fallback */
+    }
+    return (int)w.ws_col;
+}
+
+/* read names (skip entries starting with '.') and compute longest length */
+static int read_names(const char *path, char ***out_names, size_t *out_count, size_t *out_maxlen) {
     DIR *d = opendir(path);
-    if (!d) {
+    if (!d) return -1;
+    struct dirent *e;
+    size_t cap = 128, n = 0;
+    char **arr = malloc(cap * sizeof(char*));
+    size_t maxlen = 0;
+    while ((e = readdir(d))) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        if (e->d_name[0] == '.') continue; /* skip hidden files */
+        if (n == cap) {
+            cap *= 2;
+            arr = realloc(arr, cap * sizeof(char*));
+        }
+        arr[n] = strdup(e->d_name);
+        size_t len = strlen(e->d_name);
+        if (len > maxlen) maxlen = len;
+        n++;
+    }
+    closedir(d);
+    if (n > 0) qsort(arr, n, sizeof(char*), cmp_strptr);
+
+    *out_names = arr;
+    *out_count = n;
+    *out_maxlen = maxlen;
+    return 0;
+}
+
+static void free_names(char **arr, size_t n) {
+    for (size_t i = 0; i < n; ++i) free(arr[i]);
+    free(arr);
+}
+
+static void column_list(const char *path) {
+    char **names = NULL;
+    size_t n = 0;
+    size_t maxlen = 0;
+    if (read_names(path, &names, &n, &maxlen) == -1) {
         fprintf(stderr, "Cannot open directory '%s': %s\n", path, strerror(errno));
         return;
     }
+    if (n == 0) { free_names(names, n); return; }
+
+    int termw = get_terminal_width();
+    int spacing = 2;
+    int colwidth = (int)maxlen + spacing;
+    if (colwidth <= 0) colwidth = 1;
+    int cols = termw / colwidth;
+    if (cols < 1) cols = 1;
+    size_t rows = (n + cols - 1) / cols;
+
+    for (size_t r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            size_t idx = c * rows + r;
+            if (idx < n) {
+                /* print name padded to colwidth (but don't add extra spacing after last col) */
+                if (c == cols - 1) printf("%s", names[idx]);
+                else printf("%-*s", colwidth, names[idx]);
+            }
+        }
+        printf("\n");
+    }
+
+    free_names(names, n);
+}
+
+/* --- fallback simple listing (not used; kept for reference) --- */
+static void simple_list(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) { fprintf(stderr, "Cannot open directory '%s': %s\n", path, strerror(errno)); return; }
     struct dirent *e;
     while ((e = readdir(d))) {
         if (strcmp(e->d_name, ".") == 0) continue;
+        if (e->d_name[0] == '.') continue;
         printf("%s\n", e->d_name);
     }
     closedir(d);
@@ -233,7 +304,7 @@ int main(int argc, char **argv) {
     if (optind < argc) path = argv[optind];
 
     if (longflag) long_list(path);
-    else simple_list(path);
+    else column_list(path);
 
     return 0;
 }
