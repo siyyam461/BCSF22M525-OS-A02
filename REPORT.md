@@ -16,3 +16,16 @@ To print items "down then across" we first collect all filenames and find the lo
 **Why ioctl (TIOCGWINSZ) is used**  
 The `ioctl` call with `TIOCGWINSZ` returns the current terminal width in columns. Using it allows the program to adapt the number of columns to the real terminal size so output fits nicely. If you always use a fixed width (like 80 columns), the layout will not adapt to larger or smaller terminals and can cause awkward wrapping or wasted space; detecting the real width yields a much closer match to the behavior of the standard `ls`.
 
+# REPORT.md – Version 1.3.0: Horizontal Column Display (-x)
+
+## Q1: Compare the implementation complexity of the "down then across" (vertical) printing logic versus the "across" (horizontal) printing logic. Which one requires more pre-calculation and why?
+
+The "down then across" (vertical) logic is more complex because it requires pre-calculation of the number of rows, distributing filenames column-wise, and managing uneven last rows. The "across" (horizontal) logic is simpler, as it only needs to track the current line width and wrap when exceeding terminal width.
+
+## Q2: Describe the strategy you used in your code to manage the different display modes (-l, -x, and default). How did your program decide which function to call for printing?
+
+I used a display mode flag (integer/enum).  
+- `-l` sets mode to long listing.  
+- `-x` sets mode to horizontal display.  
+- Default is vertical display.  
+
